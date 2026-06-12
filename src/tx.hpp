@@ -78,8 +78,11 @@ public:
     void send_session_key(void);
     void init_session(int k, int n);
     void get_fec(int &k, int &n) { k = fec_k; n = fec_n; }
+    uint8_t get_radio_port(void) const { return (uint8_t)(channel_id & 0xff); }
     virtual void select_output(int idx) = 0;
-    virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
+    // stream_tag < 0 emits legacy TX_ANT stat lines; >= 0 emits TX_ANT_S
+    // lines tagged with the stream's radio_port (multi-stream mode).
+    virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes, int stream_tag) = 0;
     virtual void update_radiotap_header(radiotap_header_t &radiotap_header) = 0;
     virtual radiotap_header_t get_radiotap_header(void) = 0;
 protected:
@@ -166,7 +169,7 @@ public:
         current_output = idx;
     }
 
-    virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes);
+    virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes, int stream_tag);
     virtual void update_radiotap_header(radiotap_header_t &radiotap_header)
     {
         this->radiotap_header = radiotap_header;
@@ -226,7 +229,7 @@ public:
         saddr.sin_port = htons((unsigned short)base_port);
     }
 
-    virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) {}
+    virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes, int stream_tag) {}
 
     virtual ~UdpTransmitter()
     {
@@ -322,7 +325,7 @@ public:
         current_output = idx;
     }
 
-    virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes);
+    virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes, int stream_tag);
     virtual void update_radiotap_header(radiotap_header_t &radiotap_header)
     {
         this->radiotap_header = radiotap_header;

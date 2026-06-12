@@ -428,16 +428,30 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
 
 }
 
-void RawSocketTransmitter::dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes)
+void RawSocketTransmitter::dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes, int stream_tag)
 {
     for(auto it = antenna_stat.begin(); it != antenna_stat.end(); it++)
     {
-        IPC_MSG("%" PRIu64 "\tTX_ANT\t%" PRIx64 "\t%u:%u:%" PRIu64 ":%" PRIu64 ":%" PRIu64 "\n",
-                ts, it->first,
-                it->second.count_p_injected, it->second.count_p_dropped,
-                it->second.latency_min,
-                it->second.latency_sum / (it->second.count_p_injected + it->second.count_p_dropped),
-                it->second.latency_max);
+        if (stream_tag < 0)
+        {
+            IPC_MSG("%" PRIu64 "\tTX_ANT\t%" PRIx64 "\t%u:%u:%" PRIu64 ":%" PRIu64 ":%" PRIu64 "\n",
+                    ts, it->first,
+                    it->second.count_p_injected, it->second.count_p_dropped,
+                    it->second.latency_min,
+                    it->second.latency_sum / (it->second.count_p_injected + it->second.count_p_dropped),
+                    it->second.latency_max);
+        }
+        else
+        {
+            // Multi-stream mode: tag the line with the stream's radio_port.
+            // Unknown command tags are ignored by legacy stats parsers.
+            IPC_MSG("%" PRIu64 "\tTX_ANT_S\t%d\t%" PRIx64 "\t%u:%u:%" PRIu64 ":%" PRIu64 ":%" PRIu64 "\n",
+                    ts, stream_tag, it->first,
+                    it->second.count_p_injected, it->second.count_p_dropped,
+                    it->second.latency_min,
+                    it->second.latency_sum / (it->second.count_p_injected + it->second.count_p_dropped),
+                    it->second.latency_max);
+        }
 
         injected_packets += it->second.count_p_injected;
         dropped_packets += it->second.count_p_dropped;
@@ -599,16 +613,28 @@ void RemoteTransmitter::inject_packet(const uint8_t *buf, size_t size)
 
 }
 
-void RemoteTransmitter::dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes)
+void RemoteTransmitter::dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes, int stream_tag)
 {
     for(auto it = antenna_stat.begin(); it != antenna_stat.end(); it++)
     {
-        IPC_MSG("%" PRIu64 "\tTX_ANT\t%" PRIx64 "\t%u:%u:%" PRIu64 ":%" PRIu64 ":%" PRIu64 "\n",
-                ts, it->first,
-                it->second.count_p_injected, it->second.count_p_dropped,
-                it->second.latency_min,
-                it->second.latency_sum / (it->second.count_p_injected + it->second.count_p_dropped),
-                it->second.latency_max);
+        if (stream_tag < 0)
+        {
+            IPC_MSG("%" PRIu64 "\tTX_ANT\t%" PRIx64 "\t%u:%u:%" PRIu64 ":%" PRIu64 ":%" PRIu64 "\n",
+                    ts, it->first,
+                    it->second.count_p_injected, it->second.count_p_dropped,
+                    it->second.latency_min,
+                    it->second.latency_sum / (it->second.count_p_injected + it->second.count_p_dropped),
+                    it->second.latency_max);
+        }
+        else
+        {
+            IPC_MSG("%" PRIu64 "\tTX_ANT_S\t%d\t%" PRIx64 "\t%u:%u:%" PRIu64 ":%" PRIu64 ":%" PRIu64 "\n",
+                    ts, stream_tag, it->first,
+                    it->second.count_p_injected, it->second.count_p_dropped,
+                    it->second.latency_min,
+                    it->second.latency_sum / (it->second.count_p_injected + it->second.count_p_dropped),
+                    it->second.latency_max);
+        }
 
         injected_packets += it->second.count_p_injected;
         dropped_packets += it->second.count_p_dropped;
@@ -739,6 +765,164 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
     return 0;
 }
 
+// Drain and answer all pending control requests on the control socket.
+// stream_ts holds one Transmitter per stream; legacy (non-stream) commands
+// address stream_ts[0], which is the only stream in single-stream mode.
+static void process_control_fd(int fd, const vector<Transmitter*> &stream_ts)
+{
+    Transmitter *t = stream_ts[0];
+
+    for(;;)
+    {
+        cmd_req_t req = {};
+        cmd_resp_t resp = {};
+        ssize_t rsize;
+        struct sockaddr_in from_addr;
+        socklen_t addr_size = sizeof(from_addr);
+
+        if ((rsize = recvfrom(fd, &req, sizeof(req), MSG_DONTWAIT, (sockaddr*)&from_addr, &addr_size )) < 0 || addr_size > sizeof(from_addr))
+        {
+            if (errno != EWOULDBLOCK) throw runtime_error(string_format("Error receiving packet: %s", strerror(errno)));
+            break;
+        }
+
+        if(rsize < (ssize_t)offsetof(cmd_req_t, u)) continue;
+
+        resp.req_id = req.req_id;
+        resp.rc = 0;
+
+        switch(req.cmd_id)
+        {
+        case CMD_SET_FEC:
+        {
+            if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_fec))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            int fec_k = req.u.cmd_set_fec.k;
+            int fec_n = req.u.cmd_set_fec.n;
+
+            if(!(fec_k <= fec_n && fec_k >=1 && fec_n >= 1 && fec_n < 256))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                WFB_ERR("Rejecting new FEC settings");
+                continue;
+            }
+
+            // Close open FEC block if any
+            while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
+
+            t->init_session(fec_k, fec_n);
+
+            // Emulate FEC for initial session key distribution
+            for(int i = 0; i < fec_n - fec_k + 1; i++)
+            {
+                t->send_session_key();
+            }
+
+            sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+            WFB_INFO("Session restarted with FEC %d/%d\n", fec_k, fec_n);
+        }
+        break;
+
+        case CMD_SET_RADIO:
+        {
+            if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_radio))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            try
+            {
+                auto radiotap_header = init_radiotap_header(req.u.cmd_set_radio.stbc,
+                                                            req.u.cmd_set_radio.ldpc,
+                                                            req.u.cmd_set_radio.short_gi,
+                                                            req.u.cmd_set_radio.bandwidth,
+                                                            req.u.cmd_set_radio.mcs_index,
+                                                            req.u.cmd_set_radio.vht_mode,
+                                                            req.u.cmd_set_radio.vht_nss);
+                t->update_radiotap_header(radiotap_header);
+            }
+            catch(runtime_error &e)
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                WFB_ERR("Rejecting new radiotap header: %s\n", e.what());
+                continue;
+            }
+
+            sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+            WFB_INFO("Radiotap updated with stbc=%d, ldpc=%d, short_gi=%d, bandwidth=%d, mcs_index=%d, vht_mode=%d, vht_nss=%d\n",
+                    req.u.cmd_set_radio.stbc,
+                    req.u.cmd_set_radio.ldpc,
+                    req.u.cmd_set_radio.short_gi,
+                    req.u.cmd_set_radio.bandwidth,
+                    req.u.cmd_set_radio.mcs_index,
+                    req.u.cmd_set_radio.vht_mode,
+                    req.u.cmd_set_radio.vht_nss);
+        }
+        break;
+
+        case CMD_GET_FEC:
+        {
+            int fec_k = 0, fec_n = 0;
+
+            if (rsize != offsetof(cmd_req_t, u))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            t->get_fec(fec_k, fec_n);
+
+            resp.u.cmd_get_fec.k = fec_k;
+            resp.u.cmd_get_fec.n = fec_n;
+
+            sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_fec), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+        }
+        break;
+
+        case CMD_GET_RADIO:
+        {
+            if (rsize != offsetof(cmd_req_t, u))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            radiotap_header_t hdr = t->get_radiotap_header();
+
+            resp.u.cmd_get_radio.stbc = hdr.stbc;
+            resp.u.cmd_get_radio.ldpc = hdr.ldpc;
+            resp.u.cmd_get_radio.short_gi = hdr.short_gi;
+            resp.u.cmd_get_radio.bandwidth = hdr.bandwidth;
+            resp.u.cmd_get_radio.mcs_index = hdr.mcs_index;
+            resp.u.cmd_get_radio.vht_mode = hdr.vht_mode;
+            resp.u.cmd_get_radio.vht_nss = hdr.vht_nss;
+
+            sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_radio), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+        }
+        break;
+
+        default:
+        {
+            resp.rc = htonl(ENOTSUP);
+            sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+            continue;
+        }
+        break;
+        }
+    }
+}
+
 void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd, int fec_timeout, bool mirror, int log_interval)
 {
     int nfds = rx_fd.size();
@@ -791,7 +975,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
 
         if (cur_ts >= log_send_ts)  // log timeout expired
         {
-            t->dump_stats(cur_ts, count_p_injected, count_p_dropped, count_b_injected);
+            t->dump_stats(cur_ts, count_p_injected, count_p_dropped, count_b_injected, -1);
 
             IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u\n",
                     cur_ts, count_p_fec_timeouts, count_p_incoming, count_b_incoming, count_p_injected, count_b_injected, count_p_dropped, count_p_truncated);
@@ -827,157 +1011,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
         if (rc > 0 && fds[nfds].revents & POLLIN)
         {
             rc -= 1;
-            int fd = fds[nfds].fd;
-
-            for(;;)
-            {
-                cmd_req_t req = {};
-                cmd_resp_t resp = {};
-                ssize_t rsize;
-                struct sockaddr_in from_addr;
-                socklen_t addr_size = sizeof(from_addr);
-
-                if ((rsize = recvfrom(fd, &req, sizeof(req), MSG_DONTWAIT, (sockaddr*)&from_addr, &addr_size )) < 0 || addr_size > sizeof(from_addr))
-                {
-                    if (errno != EWOULDBLOCK) throw runtime_error(string_format("Error receiving packet: %s", strerror(errno)));
-                    break;
-                }
-
-                if(rsize < (ssize_t)offsetof(cmd_req_t, u)) continue;
-
-                resp.req_id = req.req_id;
-                resp.rc = 0;
-
-                switch(req.cmd_id)
-                {
-                case CMD_SET_FEC:
-                {
-                    if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_fec))
-                    {
-                        resp.rc = htonl(EINVAL);
-                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                        continue;
-                    }
-
-                    int fec_k = req.u.cmd_set_fec.k;
-                    int fec_n = req.u.cmd_set_fec.n;
-
-                    if(!(fec_k <= fec_n && fec_k >=1 && fec_n >= 1 && fec_n < 256))
-                    {
-                        resp.rc = htonl(EINVAL);
-                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                        WFB_ERR("Rejecting new FEC settings");
-                        continue;
-                    }
-
-                    // Close open FEC block if any
-                    while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
-
-                    t->init_session(fec_k, fec_n);
-
-                    // Emulate FEC for initial session key distribution
-                    for(int i = 0; i < fec_n - fec_k + 1; i++)
-                    {
-                        t->send_session_key();
-                    }
-
-                    sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                    WFB_INFO("Session restarted with FEC %d/%d\n", fec_k, fec_n);
-                }
-                break;
-
-                case CMD_SET_RADIO:
-                {
-                    if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_radio))
-                    {
-                        resp.rc = htonl(EINVAL);
-                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                        continue;
-                    }
-
-                    try
-                    {
-                        auto radiotap_header = init_radiotap_header(req.u.cmd_set_radio.stbc,
-                                                                    req.u.cmd_set_radio.ldpc,
-                                                                    req.u.cmd_set_radio.short_gi,
-                                                                    req.u.cmd_set_radio.bandwidth,
-                                                                    req.u.cmd_set_radio.mcs_index,
-                                                                    req.u.cmd_set_radio.vht_mode,
-                                                                    req.u.cmd_set_radio.vht_nss);
-                        t->update_radiotap_header(radiotap_header);
-                    }
-                    catch(runtime_error &e)
-                    {
-                        resp.rc = htonl(EINVAL);
-                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                        WFB_ERR("Rejecting new radiotap header: %s\n", e.what());
-                        continue;
-                    }
-
-                    sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                    WFB_INFO("Radiotap updated with stbc=%d, ldpc=%d, short_gi=%d, bandwidth=%d, mcs_index=%d, vht_mode=%d, vht_nss=%d\n",
-                            req.u.cmd_set_radio.stbc,
-                            req.u.cmd_set_radio.ldpc,
-                            req.u.cmd_set_radio.short_gi,
-                            req.u.cmd_set_radio.bandwidth,
-                            req.u.cmd_set_radio.mcs_index,
-                            req.u.cmd_set_radio.vht_mode,
-                            req.u.cmd_set_radio.vht_nss);
-                }
-                break;
-
-                case CMD_GET_FEC:
-                {
-                    int fec_k = 0, fec_n = 0;
-
-                    if (rsize != offsetof(cmd_req_t, u))
-                    {
-                        resp.rc = htonl(EINVAL);
-                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                        continue;
-                    }
-
-                    t->get_fec(fec_k, fec_n);
-
-                    resp.u.cmd_get_fec.k = fec_k;
-                    resp.u.cmd_get_fec.n = fec_n;
-
-                    sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_fec), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                }
-                break;
-
-                case CMD_GET_RADIO:
-                {
-                    if (rsize != offsetof(cmd_req_t, u))
-                    {
-                        resp.rc = htonl(EINVAL);
-                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                        continue;
-                    }
-
-                    radiotap_header_t hdr = t->get_radiotap_header();
-
-                    resp.u.cmd_get_radio.stbc = hdr.stbc;
-                    resp.u.cmd_get_radio.ldpc = hdr.ldpc;
-                    resp.u.cmd_get_radio.short_gi = hdr.short_gi;
-                    resp.u.cmd_get_radio.bandwidth = hdr.bandwidth;
-                    resp.u.cmd_get_radio.mcs_index = hdr.mcs_index;
-                    resp.u.cmd_get_radio.vht_mode = hdr.vht_mode;
-                    resp.u.cmd_get_radio.vht_nss = hdr.vht_nss;
-
-                    sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_radio), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                }
-                break;
-
-                default:
-                {
-                    resp.rc = htonl(ENOTSUP);
-                    sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                    continue;
-                }
-                break;
-                }
-            }
+            vector<Transmitter*> stream_ts = { t.get() };
+            process_control_fd(fds[nfds].fd, stream_ts);
         }
 
         if (rc == 0) // poll timeout
