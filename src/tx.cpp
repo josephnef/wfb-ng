@@ -1561,6 +1561,452 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
 }
 
 
+// Parse one "-y key=val,..." stream spec. Unset numeric fields stay -1
+// and inherit the corresponding global option at stream creation time.
+stream_spec_t parse_stream_spec(const char *arg)
+{
+    stream_spec_t spec;
+
+    spec.udp_port = -1;
+    spec.radio_port = -1;
+    spec.k = -1;
+    spec.n = -1;
+    spec.fec_timeout = -1;
+    spec.fec_delay = -1;
+    spec.mcs_index = -1;
+    spec.bandwidth = -1;
+    spec.short_gi = -1;
+    spec.stbc = -1;
+    spec.ldpc = -1;
+    spec.vht_mode = -1;
+    spec.vht_nss = -1;
+
+    char *tmp = strdup(arg);
+    if (tmp == NULL)
+    {
+        throw runtime_error("strdup failed");
+    }
+
+    try
+    {
+        char *cursor = tmp;
+        char *item;
+
+        while ((item = strsep(&cursor, ",")) != NULL)
+        {
+            if (item[0] == '\0') continue;
+
+            char *value = item;
+            char *key = strsep(&value, "=");
+
+            if (value == NULL || value[0] == '\0')
+            {
+                throw runtime_error(string_format("Stream spec item without value: %s", item));
+            }
+
+            if (strcmp(key, "u") == 0)             spec.udp_port = atoi(value);
+            else if (strcmp(key, "shm") == 0)      spec.shm_name = string(value);
+            else if (strcmp(key, "p") == 0)        spec.radio_port = atoi(value);
+            else if (strcmp(key, "k") == 0)        spec.k = atoi(value);
+            else if (strcmp(key, "n") == 0)        spec.n = atoi(value);
+            else if (strcmp(key, "T") == 0)        spec.fec_timeout = atoi(value);
+            else if (strcmp(key, "F") == 0)        spec.fec_delay = atoll(value);
+            else if (strcmp(key, "mcs") == 0)      spec.mcs_index = atoi(value);
+            else if (strcmp(key, "bw") == 0)       spec.bandwidth = atoi(value);
+            else if (strcmp(key, "gi") == 0)       spec.short_gi = (value[0] == 's' || value[0] == 'S') ? 1 : 0;
+            else if (strcmp(key, "stbc") == 0)     spec.stbc = atoi(value);
+            else if (strcmp(key, "ldpc") == 0)     spec.ldpc = atoi(value);
+            else if (strcmp(key, "vht") == 0)      spec.vht_mode = atoi(value);
+            else if (strcmp(key, "nss") == 0)      spec.vht_nss = atoi(value);
+            else
+            {
+                throw runtime_error(string_format("Unknown stream spec key: %s", key));
+            }
+        }
+    }
+    catch(...)
+    {
+        free(tmp);
+        throw;
+    }
+
+    free(tmp);
+
+    if (spec.radio_port < 0 || spec.radio_port > 255)
+    {
+        throw runtime_error(string_format("Stream spec needs p=<radio_port> in [0, 255]: %s", arg));
+    }
+
+    if ((spec.udp_port > 0) == !spec.shm_name.empty())
+    {
+        throw runtime_error(string_format("Stream spec needs exactly one input: u=<udp_port> or shm=<ring_name>: %s", arg));
+    }
+
+    return spec;
+}
+
+void validate_stream_specs(const vector<stream_spec_t> &specs)
+{
+    if (specs.size() > MAX_TX_STREAMS)
+    {
+        throw runtime_error(string_format("Too many streams: %zu > %d", specs.size(), MAX_TX_STREAMS));
+    }
+
+    for(size_t i = 0; i < specs.size(); i++)
+    {
+        for(size_t j = i + 1; j < specs.size(); j++)
+        {
+            if (specs[i].radio_port == specs[j].radio_port)
+            {
+                throw runtime_error(string_format("Duplicate radio_port %d in stream specs", specs[i].radio_port));
+            }
+
+            if (specs[i].udp_port > 0 && specs[i].udp_port == specs[j].udp_port)
+            {
+                throw runtime_error(string_format("Duplicate udp_port %d in stream specs", specs[i].udp_port));
+            }
+        }
+    }
+}
+
+// Per-stream runtime state for the multi-stream data source.
+typedef struct {
+    unique_ptr<Transmitter> t;
+    int rx_fd;
+    int fec_timeout;                     // [ms], 0 = disabled
+    uint64_t fec_close_ts;               // 0 = no pending close
+    uint64_t session_key_announce_ts;
+    uint32_t rxq_overflow;
+
+    // per-stream counters, reset each log interval
+    uint32_t count_p_fec_timeouts;
+    uint32_t count_p_incoming;
+    uint32_t count_b_incoming;
+    uint32_t count_p_injected;
+    uint32_t count_b_injected;
+    uint32_t count_p_dropped;
+    uint32_t count_p_truncated;
+} tx_stream_t;
+
+// Multi-stream event loop. Stream order is strict drain priority:
+// on every wakeup ready inputs are serviced lowest-index-first and
+// drained fully, so when the radio (or its qdisc) saturates, the
+// kernel socket buffers of later streams overflow first. That is the
+// intended unequal-protection behavior for layered video: the base
+// layer is configured as stream 0 and keeps flowing while droppable
+// enhancement streams shed load.
+void multi_stream_data_source(vector<tx_stream_t> &streams, int control_fd, bool mirror, int log_interval)
+{
+    int nfds = streams.size();
+    assert(nfds > 0);
+
+    struct pollfd fds[nfds + 1];
+    memset(fds, '\0', sizeof(fds));
+
+    for(int i = 0; i < nfds; i++)
+    {
+        fds[i].fd = streams[i].rx_fd;
+        fds[i].events = POLLIN;
+    }
+
+    fds[nfds].fd = control_fd;
+    fds[nfds].events = POLLIN;
+
+    vector<Transmitter*> stream_ts;
+    for(auto &s : streams)
+    {
+        stream_ts.push_back(s.t.get());
+    }
+
+    uint64_t log_send_ts = get_time_ms();
+
+    for(auto &s : streams)
+    {
+        s.session_key_announce_ts = log_send_ts;
+        s.fec_close_ts = s.fec_timeout > 0 ? log_send_ts + s.fec_timeout : 0;
+    }
+
+    for(;;)
+    {
+        uint64_t cur_ts = get_time_ms();
+        int poll_timeout = log_send_ts > cur_ts ? log_send_ts - cur_ts : 0;
+
+        for(auto &s : streams)
+        {
+            if (s.fec_timeout > 0)
+            {
+                poll_timeout = std::min(poll_timeout, (int)(s.fec_close_ts > cur_ts ? s.fec_close_ts - cur_ts : 0));
+            }
+        }
+
+        int rc = poll(fds, nfds + 1, poll_timeout);
+
+        if (rc < 0)
+        {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            throw runtime_error(string_format("poll error: %s", strerror(errno)));
+        }
+
+        cur_ts = get_time_ms();
+
+        if (cur_ts >= log_send_ts)  // log timeout expired
+        {
+            uint32_t agg_fec_timeouts = 0, agg_p_incoming = 0, agg_b_incoming = 0;
+            uint32_t agg_p_injected = 0, agg_b_injected = 0, agg_p_dropped = 0, agg_p_truncated = 0;
+
+            for(auto &s : streams)
+            {
+                int stream_tag = s.t->get_radio_port();
+
+                s.t->dump_stats(cur_ts, s.count_p_injected, s.count_p_dropped, s.count_b_injected, stream_tag);
+
+                IPC_MSG("%" PRIu64 "\tPKT_S\t%d\t%u:%u:%u:%u:%u:%u:%u\n",
+                        cur_ts, stream_tag, s.count_p_fec_timeouts, s.count_p_incoming, s.count_b_incoming,
+                        s.count_p_injected, s.count_b_injected, s.count_p_dropped, s.count_p_truncated);
+
+                agg_fec_timeouts += s.count_p_fec_timeouts;
+                agg_p_incoming += s.count_p_incoming;
+                agg_b_incoming += s.count_b_incoming;
+                agg_p_injected += s.count_p_injected;
+                agg_b_injected += s.count_b_injected;
+                agg_p_dropped += s.count_p_dropped;
+                agg_p_truncated += s.count_p_truncated;
+
+                if(s.count_p_dropped)
+                {
+                    WFB_ERR("stream %d: %u packets dropped\n", stream_tag, s.count_p_dropped);
+                }
+
+                if(s.count_p_truncated)
+                {
+                    WFB_ERR("stream %d: %u packets truncated\n", stream_tag, s.count_p_truncated);
+                }
+
+                s.count_p_fec_timeouts = 0;
+                s.count_p_incoming = 0;
+                s.count_b_incoming = 0;
+                s.count_p_injected = 0;
+                s.count_b_injected = 0;
+                s.count_p_dropped = 0;
+                s.count_p_truncated = 0;
+            }
+
+            // Aggregate line keeps the legacy stats consumers working
+            IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u\n",
+                    cur_ts, agg_fec_timeouts, agg_p_incoming, agg_b_incoming,
+                    agg_p_injected, agg_b_injected, agg_p_dropped, agg_p_truncated);
+            IPC_MSG_SEND();
+
+            log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
+        }
+
+        // Close timed-out FEC blocks per stream. A busy stream pushes
+        // only its own fec_close_ts forward, so an idle stream still
+        // flushes its open block on time.
+        for(auto &s : streams)
+        {
+            if (s.fec_timeout > 0 && cur_ts >= s.fec_close_ts)
+            {
+                if(s.t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY))
+                {
+                    s.count_p_fec_timeouts += 1;
+                }
+                s.fec_close_ts = cur_ts + s.fec_timeout;
+            }
+        }
+
+        if (rc == 0) continue;  // poll timeout, no events
+
+        // Check control socket
+        if (fds[nfds].revents & (POLLERR | POLLNVAL))
+        {
+            throw runtime_error(string_format("socket error: %s", strerror(errno)));
+        }
+
+        if (fds[nfds].revents & POLLIN)
+        {
+            rc -= 1;
+            process_control_fd(fds[nfds].fd, stream_ts);
+        }
+
+        // Strict priority drain: lowest stream index first, drained fully.
+        for(int i = 0; i < nfds && rc > 0; i++)
+        {
+            if (fds[i].revents & (POLLERR | POLLNVAL))
+            {
+                throw runtime_error(string_format("socket error: %s", strerror(errno)));
+            }
+
+            if (!(fds[i].revents & POLLIN)) continue;
+
+            rc -= 1;
+
+            tx_stream_t &s = streams[i];
+            uint8_t buf[MAX_PAYLOAD_SIZE + 1];
+            uint8_t cmsgbuf[CMSG_SPACE(sizeof(uint32_t))];
+
+            s.t->select_output(mirror ? -1 : 0);
+
+            for(;;)
+            {
+                ssize_t rsize;
+                struct iovec iov = { .iov_base = (void*)buf,
+                                     .iov_len = sizeof(buf) };
+
+                struct msghdr msghdr = { .msg_name = NULL,
+                                         .msg_namelen = 0,
+                                         .msg_iov = &iov,
+                                         .msg_iovlen = 1,
+                                         .msg_control = &cmsgbuf,
+                                         .msg_controllen = sizeof(cmsgbuf),
+                                         .msg_flags = 0 };
+
+                memset(cmsgbuf, '\0', sizeof(cmsgbuf));
+
+                if ((rsize = recvmsg(s.rx_fd, &msghdr, MSG_DONTWAIT)) < 0)
+                {
+                    if (errno != EWOULDBLOCK) throw runtime_error(string_format("Error receiving packet: %s", strerror(errno)));
+                    break;
+                }
+
+                s.count_p_incoming += 1;
+                s.count_b_incoming += rsize;
+
+                if (rsize > (ssize_t)MAX_PAYLOAD_SIZE)
+                {
+                    rsize = MAX_PAYLOAD_SIZE;
+                    s.count_p_truncated += 1;
+                }
+
+                uint32_t cur_rxq_overflow = extract_rxq_overflow(&msghdr);
+                if (cur_rxq_overflow != s.rxq_overflow)
+                {
+                    // Count dropped packets as possible incoming
+                    s.count_p_dropped += (cur_rxq_overflow - s.rxq_overflow);
+                    s.count_p_incoming += (cur_rxq_overflow - s.rxq_overflow);
+                    s.rxq_overflow = cur_rxq_overflow;
+                }
+
+                cur_ts = get_time_ms();
+
+                if (cur_ts >= s.session_key_announce_ts)
+                {
+                    // Announce session key
+                    s.t->send_session_key();
+
+                    // Session packet interval is not in fixed grid because
+                    // we yield session packets only if there are data packets
+                    s.session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
+                }
+
+                s.t->send_packet(buf, rsize, 0);
+
+                if (cur_ts >= log_send_ts)  // log timeout expired
+                {
+                    // Leave the drain; stats run on the next iteration and
+                    // strict priority restarts from stream 0 anyway.
+                    rc = 0;
+                    break;
+                }
+            }
+
+            // reset fec timeout because data arrived on this stream
+            if (s.fec_timeout > 0)
+            {
+                s.fec_close_ts = get_time_ms() + s.fec_timeout;
+            }
+        }
+    }
+}
+
+void local_loop_multi(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
+                      const vector<stream_spec_t> &specs, int debug_port, int k, int n, const string &keypair,
+                      int fec_timeout, uint64_t epoch, uint32_t link_id, uint32_t fec_delay, bool use_qdisc,
+                      uint32_t fwmark, int stbc, int ldpc, int short_gi, int bandwidth, int mcs_index,
+                      bool vht_mode, int vht_nss, uint8_t frame_type, int control_port, bool mirror,
+                      int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
+{
+    vector<string> wlans;
+    vector<tx_stream_t> streams(specs.size());
+
+    for(int i = 0; optind + i < argc; i++)
+    {
+        wlans.push_back(string(argv[optind + i]));
+    }
+
+    for(size_t i = 0; i < specs.size(); i++)
+    {
+        const stream_spec_t &spec = specs[i];
+        tx_stream_t &s = streams[i];
+        vector<tags_item_t> tags;
+
+        uint32_t channel_id = (link_id << 8) + spec.radio_port;
+        int stream_k = spec.k >= 0 ? spec.k : k;
+        int stream_n = spec.n >= 0 ? spec.n : n;
+        uint32_t stream_fec_delay = spec.fec_delay >= 0 ? (uint32_t)spec.fec_delay : fec_delay;
+
+        if (!(stream_k <= stream_n && stream_k >= 1 && stream_n >= 1 && stream_n < 256))
+        {
+            throw runtime_error(string_format("Invalid FEC %d/%d for stream %d", stream_k, stream_n, spec.radio_port));
+        }
+
+        s.fec_timeout = spec.fec_timeout >= 0 ? spec.fec_timeout : fec_timeout;
+        s.rxq_overflow = 0;
+        s.count_p_fec_timeouts = 0;
+        s.count_p_incoming = 0;
+        s.count_b_incoming = 0;
+        s.count_p_injected = 0;
+        s.count_b_injected = 0;
+        s.count_p_dropped = 0;
+        s.count_p_truncated = 0;
+
+        if (!spec.shm_name.empty())
+        {
+            throw runtime_error("shm= stream input is not supported yet");
+        }
+
+        s.rx_fd = open_udp_socket_for_rx(spec.udp_port, rcv_buf);
+        WFB_INFO("Stream %d: listen on %d, FEC %d/%d, priority %zu\n",
+                 spec.radio_port, spec.udp_port, stream_k, stream_n, i);
+
+        if (debug_port)
+        {
+            // Stream i gets its own debug port range so emulated wlan
+            // packets stay per-stream: port = debug_port + i*W + wlan_idx
+            int stream_debug_base = debug_port + (int)(i * wlans.size());
+            s.t = unique_ptr<UdpTransmitter>(new UdpTransmitter(stream_k, stream_n, keypair, "127.0.0.1", stream_debug_base,
+                                                                epoch, channel_id, stream_fec_delay, tags, use_qdisc, fwmark,
+                                                                snd_buf_size));
+        }
+        else
+        {
+            auto stream_radiotap_header = init_radiotap_header(
+                spec.stbc >= 0 ? spec.stbc : stbc,
+                spec.ldpc >= 0 ? (spec.ldpc != 0) : (ldpc != 0),
+                spec.short_gi >= 0 ? (spec.short_gi != 0) : (short_gi != 0),
+                spec.bandwidth >= 0 ? spec.bandwidth : bandwidth,
+                spec.mcs_index >= 0 ? spec.mcs_index : mcs_index,
+                spec.vht_mode >= 0 ? (spec.vht_mode != 0) : (vht_mode || spec.bandwidth >= 80),
+                spec.vht_nss >= 0 ? spec.vht_nss : vht_nss);
+
+            s.t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(stream_k, stream_n, keypair, epoch, channel_id,
+                                                                            stream_fec_delay, tags, wlans, stream_radiotap_header,
+                                                                            frame_type, use_qdisc, fwmark,
+                                                                            inject_retries, inject_retry_delay));
+        }
+    }
+
+    if (debug_port)
+    {
+        WFB_INFO("Using %zu ports from %d for wlan emulation (%zu per stream)\n",
+                 wlans.size() * specs.size(), debug_port, wlans.size());
+    }
+
+    int control_fd = open_control_fd(control_port);
+    multi_stream_data_source(streams, control_fd, mirror, log_interval);
+}
+
+
 void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                       int udp_port, int k, int n, const string &keypair, int fec_timeout,
                       uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
@@ -1731,8 +2177,10 @@ int main(int argc, char * const *argv)
     char *unix_socket = NULL;
     uint32_t inject_retries = 0;
     uint32_t inject_retry_delay = 5000; // 5ms
+    bool udp_port_given = false;
+    vector<string> stream_args;
 
-    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:")) != -1) {
+    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:y:")) != -1) {
         switch (opt) {
         case 'I':
             tx_mode = INJECTOR;
@@ -1752,6 +2200,10 @@ int main(int argc, char * const *argv)
             break;
         case 'u':
             udp_port = atoi(optarg);
+            udp_port_given = true;
+            break;
+        case 'y':
+            stream_args.push_back(string(optarg));
             break;
         case 'U':
             unix_socket = optarg;
@@ -1863,6 +2315,12 @@ int main(int argc, char * const *argv)
                     argv[0]);
             WFB_INFO("TX injector: %s -I port [-Q] [-R rcv_buf] [-l log_interval] interface1 [interface2] ...\n",
                     argv[0]);
+            WFB_INFO("Multi-stream TX: %s -y stream_spec [-y stream_spec] ... [common Local TX options] interface1 [interface2] ...\n"
+                     "                 stream_spec: u=<udp_port>,p=<radio_port>[,k=...][,n=...][,T=fec_timeout][,F=fec_delay]\n"
+                     "                              [,mcs=...][,bw=...][,gi={short|long}][,stbc=...][,ldpc=...][,vht={0|1}][,nss=...]\n"
+                     "                 Spec order is strict drain priority (first = highest). Unset keys inherit the global options.\n"
+                     "                 Each stream gets its own FEC encoder, session key and radiotap header on the same link_id.\n",
+                    argv[0]);
             WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u\n",
                      keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay);
             WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
@@ -1902,6 +2360,19 @@ int main(int argc, char * const *argv)
         auto radiotap_header = init_radiotap_header(stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss);
         uint32_t channel_id = (link_id << 8) + radio_port;
 
+        if (!stream_args.empty())
+        {
+            if (tx_mode != LOCAL)
+            {
+                throw runtime_error("Multi-stream specs (-y) are only supported in local TX mode");
+            }
+
+            if (unix_socket != NULL || udp_port_given)
+            {
+                throw runtime_error("Multi-stream mode: stream inputs are defined inside -y specs, not via -u/-U");
+            }
+        }
+
         switch(tx_mode)
         {
         case INJECTOR:
@@ -1909,7 +2380,25 @@ int main(int argc, char * const *argv)
             break;
 
         case LOCAL:
-            if (unix_socket != NULL)
+            if (!stream_args.empty())
+            {
+                vector<stream_spec_t> stream_specs;
+
+                for(auto &arg : stream_args)
+                {
+                    stream_specs.push_back(parse_stream_spec(arg.c_str()));
+                }
+
+                validate_stream_specs(stream_specs);
+
+                local_loop_multi(argc, argv, optind, rcv_buf, log_interval,
+                                 stream_specs, debug_port, k, n, keypair, fec_timeout,
+                                 epoch, link_id, fec_delay, use_qdisc, fwmark,
+                                 stbc, ldpc, short_gi, bandwidth, mcs_index,
+                                 vht_mode, vht_nss, frame_type, control_port, mirror,
+                                 snd_buf, inject_retries, inject_retry_delay);
+            }
+            else if (unix_socket != NULL)
             {
                 local_loop_unix(argc, argv, optind, rcv_buf, log_interval,
                                 unix_socket, debug_port, k, n, keypair, fec_timeout,

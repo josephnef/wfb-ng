@@ -69,6 +69,33 @@ typedef enum {
     DISTRIBUTOR
 } tx_mode_t;
 
+// Multi-stream mode (-y): one stream definition per option instance.
+// Spec order is strict drain priority: earlier streams are serviced
+// first on every wakeup, so under radio saturation later (lower
+// priority) streams overflow their socket buffers first.
+#define MAX_TX_STREAMS 16
+
+typedef struct {
+    int udp_port;        // > 0: UDP input port ("u=" key)
+    std::string shm_name;// non-empty: waybeam venc_ring SHM input ("shm=" key)
+    int radio_port;      // "p=" key, 0..255, unique per stream, required
+
+    // FEC settings; -1 = inherit the corresponding global option
+    int k;               // "k="
+    int n;               // "n="
+    int fec_timeout;     // "T=" [ms]
+    int64_t fec_delay;   // "F=" [us]
+
+    // Per-stream radiotap overrides; -1 = inherit the global option
+    int mcs_index;       // "mcs="
+    int bandwidth;       // "bw="
+    int short_gi;        // "gi=short" / "gi=long"
+    int stbc;            // "stbc="
+    int ldpc;            // "ldpc="
+    int vht_mode;        // "vht="
+    int vht_nss;         // "nss="
+} stream_spec_t;
+
 class Transmitter
 {
 public:
