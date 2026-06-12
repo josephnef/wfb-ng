@@ -34,6 +34,7 @@
 #include <linux/if_ether.h>
 #include <linux/random.h>
 #include <inttypes.h>
+#include <pthread.h>
 
 #include <string>
 #include <memory>
@@ -47,6 +48,11 @@ using namespace std;
 
 #include "wifibroadcast.hpp"
 #include "tx.hpp"
+
+// vendored C header (waybeam venc_ring SHM packet ring, consumer side)
+extern "C" {
+#include "venc_ring.h"
+}
 
 Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
     fec_p(NULL), fec_k(-1), fec_n(-1),
@@ -1919,6 +1925,118 @@ void multi_stream_data_source(vector<tx_stream_t> &streams, int control_fd, bool
     }
 }
 
+// SHM ring reader thread context (waybeam venc_ring input).
+typedef struct {
+    string ring_name;
+    int write_fd;       // our end of the socketpair, packets forwarded here
+    int radio_port;     // for log messages only
+} shm_reader_ctx_t;
+
+// Forward packets from a waybeam venc_ring SHM ring into the socketpair
+// consumed by multi_stream_data_source(). The ring is single-consumer,
+// so this thread is its only reader; all Transmitter state stays owned
+// by the main loop. The producer (waybeam) recreates the ring on respawn
+// with a new epoch — on read timeouts we probe the shm name and migrate
+// to the new ring when the epoch changes. A blocking write into the
+// socketpair gives natural backpressure: if the main loop falls behind,
+// the ring fills and the producer accounts drops on its side.
+static void *shm_reader_loop(void *arg)
+{
+    shm_reader_ctx_t *ctx = (shm_reader_ctx_t*)arg;
+    venc_ring_t *ring = NULL;
+    uint8_t buf[65535];
+    bool announced_wait = false;
+
+    for(;;)
+    {
+        if (ring == NULL)
+        {
+            ring = venc_ring_attach(ctx->ring_name.c_str());
+
+            if (ring == NULL)
+            {
+                if (!announced_wait)
+                {
+                    WFB_INFO("Stream %d: waiting for shm ring %s\n", ctx->radio_port, ctx->ring_name.c_str());
+                    announced_wait = true;
+                }
+                usleep(500000);
+                continue;
+            }
+
+            WFB_INFO("Stream %d: attached to shm ring %s (epoch=%u)\n",
+                     ctx->radio_port, ctx->ring_name.c_str(), ring->hdr->epoch);
+            announced_wait = false;
+        }
+
+        uint16_t len = 0;
+
+        if (venc_ring_read_wait(ring, buf, sizeof(buf), &len, 500) == 0)
+        {
+            if (len > 0 && write(ctx->write_fd, buf, len) < 0)
+            {
+                WFB_ERR("Stream %d: shm forward failed: %s\n", ctx->radio_port, strerror(errno));
+            }
+            continue;
+        }
+
+        // Read timeout: probe for a producer respawn. waybeam unlinks and
+        // recreates the ring, so a fresh attach lands on the new inode
+        // while our old mapping points at the orphaned one.
+        venc_ring_t *fresh = venc_ring_attach(ctx->ring_name.c_str());
+
+        if (fresh == NULL)
+        {
+            continue;  // producer gone, keep the old mapping and retry
+        }
+
+        if (fresh->hdr->epoch != ring->hdr->epoch)
+        {
+            WFB_INFO("Stream %d: shm ring %s recreated (epoch %u -> %u), re-attached\n",
+                     ctx->radio_port, ctx->ring_name.c_str(), ring->hdr->epoch, fresh->hdr->epoch);
+            venc_ring_destroy(ring);
+            ring = fresh;
+        }
+        else
+        {
+            venc_ring_destroy(fresh);
+        }
+    }
+
+    return NULL;
+}
+
+// Create the socketpair + detached reader thread for one shm= stream and
+// return the fd the main loop should poll.
+static int start_shm_reader(const string &ring_name, int radio_port)
+{
+    int sv[2];
+
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0)
+    {
+        throw runtime_error(string_format("Unable to create socketpair: %s", strerror(errno)));
+    }
+
+    shm_reader_ctx_t *ctx = new shm_reader_ctx_t();
+    ctx->ring_name = ring_name;
+    ctx->write_fd = sv[1];
+    ctx->radio_port = radio_port;
+
+    pthread_t tid;
+    int rc = pthread_create(&tid, NULL, shm_reader_loop, ctx);
+
+    if (rc != 0)
+    {
+        close(sv[0]);
+        close(sv[1]);
+        delete ctx;
+        throw runtime_error(string_format("Unable to start shm reader thread: %s", strerror(rc)));
+    }
+
+    pthread_detach(tid);
+    return sv[0];
+}
+
 void local_loop_multi(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                       const vector<stream_spec_t> &specs, int debug_port, int k, int n, const string &keypair,
                       int fec_timeout, uint64_t epoch, uint32_t link_id, uint32_t fec_delay, bool use_qdisc,
@@ -1962,12 +2080,16 @@ void local_loop_multi(int argc, char* const* argv, int optind, int rcv_buf, int 
 
         if (!spec.shm_name.empty())
         {
-            throw runtime_error("shm= stream input is not supported yet");
+            s.rx_fd = start_shm_reader(spec.shm_name, spec.radio_port);
+            WFB_INFO("Stream %d: shm ring %s, FEC %d/%d, priority %zu\n",
+                     spec.radio_port, spec.shm_name.c_str(), stream_k, stream_n, i);
         }
-
-        s.rx_fd = open_udp_socket_for_rx(spec.udp_port, rcv_buf);
-        WFB_INFO("Stream %d: listen on %d, FEC %d/%d, priority %zu\n",
-                 spec.radio_port, spec.udp_port, stream_k, stream_n, i);
+        else
+        {
+            s.rx_fd = open_udp_socket_for_rx(spec.udp_port, rcv_buf);
+            WFB_INFO("Stream %d: listen on %d, FEC %d/%d, priority %zu\n",
+                     spec.radio_port, spec.udp_port, stream_k, stream_n, i);
+        }
 
         if (debug_port)
         {
