@@ -51,8 +51,8 @@ src/%.o: src/%.cpp src/*.hpp src/*.h
 wfb_rx: src/rx.o src/radiotap.o src/zfex.o src/wifibroadcast.o
 	$(CXX) -o $@ $^ $(_LDFLAGS) -lpcap
 
-wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o
-	$(CXX) -o $@ $^ $(_LDFLAGS)
+wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o src/venc_ring.o
+	$(CXX) -o $@ $^ $(_LDFLAGS) -pthread
 
 fec_test: src/fec_test.cpp src/zfex.o
 	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS) $(shell pkg-config --libs catch2-with-main)

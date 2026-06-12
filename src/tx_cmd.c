@@ -79,14 +79,18 @@ int send_command(int port, cmd_req_t req, size_t req_size, cmd_resp_t *resp)
     {
     case CMD_SET_FEC:
     case CMD_SET_RADIO:
+    case CMD_SET_FEC_STREAM:
+    case CMD_SET_RADIO_STREAM:
         resp_payload_size = 0;
         break;
 
     case CMD_GET_FEC:
+    case CMD_GET_FEC_STREAM:
         resp_payload_size = sizeof(resp->u.cmd_get_fec);
         break;
 
     case CMD_GET_RADIO:
+    case CMD_GET_RADIO_STREAM:
         resp_payload_size = sizeof(resp->u.cmd_get_radio);
         break;
 
@@ -269,6 +273,233 @@ int get_radio(char *progname, int port, int argc, char **argv)
 }
 
 
+int set_fec_stream(char *progname, int port, int argc, char **argv)
+{
+    int opt;
+    int radio_port = -1;
+    uint8_t k=8, n=12;
+    cmd_req_t req = { .req_id = htonl(rand()), .cmd_id = CMD_SET_FEC_STREAM };
+    cmd_resp_t resp;
+
+    while ((opt = getopt(argc, argv, "r:k:n:h")) != -1)
+    {
+        switch (opt)
+        {
+        case 'r':
+            radio_port = atoi(optarg);
+            break;
+
+        case 'k':
+            k = atoi(optarg);
+            break;
+
+        case 'n':
+            n = atoi(optarg);
+            break;
+
+        default: /* '?' */
+            goto usage;
+        }
+    }
+
+    if (radio_port < 0 || radio_port > 255)
+    {
+    usage:
+        fprintf(stderr, "Usage: %s <port> %s -r radio_port [-k RS_K] [-n RS_N]\n", progname, argv[0]);
+        fprintf(stderr, "Default: k=%d, n=%d\n", k, n);
+        fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
+        fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
+        return 1;
+    }
+
+    req.u.cmd_set_fec_stream.radio_port = radio_port;
+    req.u.cmd_set_fec_stream.k = k;
+    req.u.cmd_set_fec_stream.n = n;
+
+    return send_command(port, req, offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_fec_stream), &resp);
+}
+
+int set_radio_stream(char *progname, int port, int argc, char **argv)
+{
+    int opt;
+    int radio_port = -1;
+    int bandwidth = 20;
+    int short_gi = 0;
+    int stbc = 0;
+    int ldpc = 0;
+    int mcs_index = 1;
+    int vht_nss = 1;
+    bool vht_mode = false;
+    cmd_req_t req = { .req_id = htonl(rand()), .cmd_id = CMD_SET_RADIO_STREAM };
+    cmd_resp_t resp;
+
+    while ((opt = getopt(argc, argv, "r:B:G:S:L:M:N:Vh")) != -1)
+    {
+        switch (opt)
+        {
+        case 'r':
+            radio_port = atoi(optarg);
+            break;
+
+        case 'B':
+            bandwidth = atoi(optarg);
+            // Force VHT mode for bandwidth >= 80
+            if (bandwidth >= 80) {
+                vht_mode = true;
+            }
+            break;
+
+        case 'G':
+            short_gi = (optarg[0] == 's' || optarg[0] == 'S') ? 1 : 0;
+            break;
+
+        case 'S':
+            stbc = atoi(optarg);
+            break;
+
+        case 'L':
+            ldpc = atoi(optarg);
+            break;
+
+        case 'M':
+            mcs_index = atoi(optarg);
+            break;
+
+        case 'N':
+            vht_nss = atoi(optarg);
+            break;
+
+        case 'V':
+            vht_mode = true;
+            break;
+
+        default: /* '?' */
+            goto usage;
+        }
+    }
+
+    if (radio_port < 0 || radio_port > 255)
+    {
+    usage:
+        fprintf(stderr, "Usage: %s <port> %s -r radio_port [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS] [-V]\n",
+                progname, argv[0]);
+        fprintf(stderr, "Default: bandwidth=%d, guard_interval=%s, stbc=%d, ldpc=%d, mcs_index=%d, vht_nss=%d, vht_mode=%d\n",
+                bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode);
+        fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
+        fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
+        return 1;
+    }
+
+    req.u.cmd_set_radio_stream.radio_port = radio_port;
+    req.u.cmd_set_radio_stream.stbc = stbc;
+    req.u.cmd_set_radio_stream.ldpc = ldpc;
+    req.u.cmd_set_radio_stream.short_gi = short_gi;
+    req.u.cmd_set_radio_stream.bandwidth = bandwidth;
+    req.u.cmd_set_radio_stream.mcs_index = mcs_index;
+    req.u.cmd_set_radio_stream.vht_mode = vht_mode;
+    req.u.cmd_set_radio_stream.vht_nss = vht_nss;
+
+    return send_command(port, req, offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_radio_stream), &resp);
+}
+
+int get_fec_stream(char *progname, int port, int argc, char **argv)
+{
+    int opt;
+    int radio_port = -1;
+    cmd_req_t req = { .req_id = htonl(rand()), .cmd_id = CMD_GET_FEC_STREAM };
+    cmd_resp_t resp;
+
+    while ((opt = getopt(argc, argv, "r:h")) != -1)
+    {
+        switch (opt)
+        {
+        case 'r':
+            radio_port = atoi(optarg);
+            break;
+
+        default: /* '?' */
+            goto usage;
+        }
+    }
+
+    if (radio_port < 0 || radio_port > 255)
+    {
+    usage:
+        fprintf(stderr, "Usage: %s <port> %s -r radio_port\n", progname, argv[0]);
+        fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
+        fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
+        return 1;
+    }
+
+    req.u.cmd_get_fec_stream.radio_port = radio_port;
+
+    int rc = send_command(port, req, offsetof(cmd_req_t, u) + sizeof(req.u.cmd_get_fec_stream), &resp);
+
+    if (rc == 0)
+    {
+        printf("k=%d\n"
+               "n=%d\n",
+               resp.u.cmd_get_fec.k,
+               resp.u.cmd_get_fec.n);
+    }
+
+    return rc;
+}
+
+int get_radio_stream(char *progname, int port, int argc, char **argv)
+{
+    int opt;
+    int radio_port = -1;
+    cmd_req_t req = { .req_id = htonl(rand()), .cmd_id = CMD_GET_RADIO_STREAM };
+    cmd_resp_t resp;
+
+    while ((opt = getopt(argc, argv, "r:h")) != -1)
+    {
+        switch (opt)
+        {
+        case 'r':
+            radio_port = atoi(optarg);
+            break;
+
+        default: /* '?' */
+            goto usage;
+        }
+    }
+
+    if (radio_port < 0 || radio_port > 255)
+    {
+    usage:
+        fprintf(stderr, "Usage: %s <port> %s -r radio_port\n", progname, argv[0]);
+        fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
+        fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
+        return 1;
+    }
+
+    req.u.cmd_get_radio_stream.radio_port = radio_port;
+
+    int rc = send_command(port, req, offsetof(cmd_req_t, u) + sizeof(req.u.cmd_get_radio_stream), &resp);
+
+    if (rc == 0)
+    {
+        printf("stbc=%d\n"
+               "ldpc=%d\n"
+               "short_gi=%d\n"
+               "bandwidth=%d\n"
+               "mcs_index=%d\n"
+               "vht_mode=%d\n"
+               "vht_nss=%d\n",
+               resp.u.cmd_get_radio.stbc,
+               resp.u.cmd_get_radio.ldpc,
+               resp.u.cmd_get_radio.short_gi,
+               resp.u.cmd_get_radio.bandwidth,
+               resp.u.cmd_get_radio.mcs_index,
+               resp.u.cmd_get_radio.vht_mode,
+               resp.u.cmd_get_radio.vht_nss);
+    }
+    return rc;
+}
+
+
 int main(int argc, char **argv)
 {
     int port;
@@ -285,7 +516,8 @@ int main(int argc, char **argv)
 
     if (argc < 3)
     {
-        fprintf(stderr, "Usage: %s <port> {set_fec | set_radio | get_fec | get_radio } ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s <port> {set_fec | set_radio | get_fec | get_radio | set_fec_stream | set_radio_stream | get_fec_stream | get_radio_stream } ...\n", argv[0]);
+        fprintf(stderr, "Per-stream commands address one stream of a multi-stream wfb_tx (-y) by its radio_port (-r).\n");
         fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
         fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
         return 1;
@@ -310,6 +542,22 @@ int main(int argc, char **argv)
     else if (strcmp(command, "get_radio") == 0)
     {
         return get_radio(argv[0], port, argc - 2, argv + 2);
+    }
+    else if (strcmp(command, "set_fec_stream") == 0)
+    {
+        return set_fec_stream(argv[0], port, argc - 2, argv + 2);
+    }
+    else if (strcmp(command, "set_radio_stream") == 0)
+    {
+        return set_radio_stream(argv[0], port, argc - 2, argv + 2);
+    }
+    else if (strcmp(command, "get_fec_stream") == 0)
+    {
+        return get_fec_stream(argv[0], port, argc - 2, argv + 2);
+    }
+    else if (strcmp(command, "get_radio_stream") == 0)
+    {
+        return get_radio_stream(argv[0], port, argc - 2, argv + 2);
     }
     else
     {
