@@ -180,6 +180,50 @@ Camera --[RTP stream (UDP)]--> wfb_ng --//--[ RADIO ]--//--> wfb_ng --[RTP strea
                 ! rtph264depay ! avdec_h264 ! clockoverlay valignment=bottom ! autovideosink fps-update-interval=1000 sync=false
  ```
 
+## Multi-stream wfb_tx (fork feature: per-stream FEC profiles in one process)
+
+One `wfb_tx` can serve several streams, each with its own radio_port, FEC profile,
+session key and radiotap header — designed for unequal error protection of layered
+video (SVC-T from [OpenIPC waybeam_venc](https://github.com/OpenIPC/waybeam_venc)):
+the always-decodable base layer rides strong FEC, the droppable enhancement layer
+rides light FEC, and one process replaces N.
+
+```
+wfb_tx -K drone.key -i 7669206 -C 7003 \
+       -y "u=5600,p=0,k=8,n=12,T=15" \      # base video    (priority 0 = drained first)
+       -y "u=5605,p=1,k=8,n=9,T=15" \       # enhance video (sheds load first when saturated)
+       wlan0
+```
+
+Stream spec keys: `u=<udp_port>` or `shm=<waybeam venc_ring name>` (input, exactly one),
+`p=<radio_port>` (required, unique), `k`/`n`/`T`/`F` (FEC), `mcs`/`bw`/`gi`/`stbc`/`ldpc`/`vht`/`nss`
+(per-stream radiotap). Unset keys inherit the global options. Spec order is strict drain
+priority: ready inputs are serviced first-spec-first and drained fully, so under radio
+saturation the kernel socket buffers of later streams overflow first — by design. Note
+that a continuously saturating higher-priority stream can starve lower ones; order
+streams by importance (base > audio > enhance > telemetry).
+
+`shm=<name>` attaches to a waybeam_venc shared-memory packet ring (`/dev/shm/<name>`,
+one complete RTP packet per slot — set waybeam's `outgoing.server` to `shm://<name>`
+and `outgoing.enhancePort` to get a second `<name>_enh` ring). The reader survives
+producer respawns (epoch-based re-attach). With debug mode (`-D port`), stream *i*
+emulates its wlans on ports `port + i*num_wlans + wlan_idx`.
+
+Runtime per-stream control (e.g. closed-loop FEC adaptation of the enhancement layer):
+
+```
+wfb_tx_cmd 7003 get_fec_stream -r 1
+wfb_tx_cmd 7003 set_fec_stream -r 1 -k 8 -n 10
+wfb_tx_cmd 7003 set_radio_stream -r 1 -M 2
+```
+
+On the ground side run one `wfb_rx` per stream as usual (`-p 0`, `-p 1`, ...). For
+SVC-T both decoded outputs can feed the same decoder port — the streams share one
+RTP sequence space (see waybeam_venc `outgoing.enhancePort`). Stats: multi-stream
+mode emits per-stream `PKT_S`/`TX_ANT_S` stdout lines tagged with the radio_port in
+addition to the legacy aggregate `PKT`/`TX_ANT` lines, which existing parsers keep
+understanding unchanged. Without any `-y` option wfb_tx behaves exactly as upstream.
+
 ## HOWTO build:
 
 For development (inline build)

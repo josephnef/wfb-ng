@@ -1,3 +1,23 @@
+fork: multi-stream wfb_tx (feat/multistream-tx)
+-----------------------------------------------
+ - One `wfb_tx` process can now serve several streams via repeatable `-y` specs
+   (`u=<udp_port>|shm=<ring>,p=<radio_port>[,k=][,n=][,T=][,F=][,mcs=][,bw=][,gi=][,stbc=][,ldpc=][,vht=][,nss=]`).
+   Each stream gets its own FEC encoder, session key and radiotap header on the shared
+   link_id, exactly as N separate processes would - but in one event loop. Without `-y`
+   nothing changes.
+ - Spec order is strict drain priority (first = highest): under radio saturation the
+   socket buffers of later streams overflow first. Intended for layered video (e.g.
+   SVC-T from OpenIPC waybeam_venc): the always-decodable base layer is stream 0 with
+   strong FEC, droppable enhancement layers ride behind it with light FEC.
+ - `shm=<ring_name>` stream input: attach to an OpenIPC waybeam_venc shared-memory
+   packet ring (`/dev/shm/<ring_name>`, vendored `src/venc_ring.{h,c}`, MIT) for a
+   syscall-free producer path. Survives producer respawn via epoch-based re-attach.
+ - Per-stream runtime control: `wfb_tx_cmd <port> {set,get}_{fec,radio}_stream -r <radio_port> ...`
+   (new control-port commands CMD_*_STREAM; legacy commands keep addressing the first
+   stream). Unknown radio_port answers ENODEV.
+ - Per-stream stdout stats: `PKT_S` / `TX_ANT_S` lines tagged with the radio_port, plus
+   the legacy aggregate `PKT` / `TX_ANT` lines so existing stats parsers keep working.
+
 23.08 upcoming release
 ----------------------
  - Mavlink parser speedup. Instead of using standard full-featured (and slow mavlink parser) now use fast packet splitter.
