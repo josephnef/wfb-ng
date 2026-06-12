@@ -507,7 +507,9 @@ class TXAntennaProtocol(LineReceiver):
             if len(cols) != 3:
                 raise BadTelemetry()
 
-            k_tuple = ('fec_timeouts', 'incoming', 'incoming_bytes', 'injected', 'injected_bytes', 'dropped', 'truncated')
+            # wait_tx_buffer counts traffic-shaper stalls (driver TX buffer
+            # near saturation); 0 when the shaper is inactive.
+            k_tuple = ('fec_timeouts', 'incoming', 'incoming_bytes', 'injected', 'injected_bytes', 'dropped', 'truncated', 'wait_tx_buffer')
             counters = tuple(int(i) for i in cols[2].split(':'))
             assert len(counters) == len(k_tuple)
 
