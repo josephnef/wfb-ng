@@ -55,8 +55,9 @@ extern "C" {
 }
 
 Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
+    fragment_idx(0),
     fec_p(NULL), fec_k(-1), fec_n(-1),
-    block_idx(0), fragment_idx(0),
+    block_idx(0),
     max_packet_size(0),
     epoch(epoch),
     channel_id(channel_id),
@@ -2006,8 +2007,11 @@ void multi_stream_data_source(vector<tx_stream_t> &streams, int control_fd, bool
                 s.count_p_truncated = 0;
             }
 
-            // Aggregate line keeps the legacy stats consumers working
-            IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u\n",
+            // Aggregate line keeps the legacy stats consumers working.
+            // Trailing 0 is the wait_tx_buffer counter introduced by the
+            // traffic shaper - not wired into multi-stream mode yet, but
+            // the PKT field count must match the single-stream format.
+            IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:0\n",
                     cur_ts, agg_fec_timeouts, agg_p_incoming, agg_b_incoming,
                     agg_p_injected, agg_b_injected, agg_p_dropped, agg_p_truncated);
             IPC_MSG_SEND();
