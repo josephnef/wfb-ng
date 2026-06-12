@@ -771,6 +771,33 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
     return 0;
 }
 
+// Resolve a per-stream command target by radio_port, NULL if no stream
+// uses that radio_port.
+static Transmitter *find_stream_by_radio_port(const vector<Transmitter*> &stream_ts, uint8_t radio_port)
+{
+    for(auto t : stream_ts)
+    {
+        if (t->get_radio_port() == radio_port) return t;
+    }
+    return NULL;
+}
+
+// Restart the session of one transmitter with new FEC settings. Shared by
+// the legacy CMD_SET_FEC and the per-stream CMD_SET_FEC_STREAM handlers.
+static void apply_fec_settings(Transmitter *t, int fec_k, int fec_n)
+{
+    // Close open FEC block if any
+    while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
+
+    t->init_session(fec_k, fec_n);
+
+    // Emulate FEC for initial session key distribution
+    for(int i = 0; i < fec_n - fec_k + 1; i++)
+    {
+        t->send_session_key();
+    }
+}
+
 // Drain and answer all pending control requests on the control socket.
 // stream_ts holds one Transmitter per stream; legacy (non-stream) commands
 // address stream_ts[0], which is the only stream in single-stream mode.
@@ -819,16 +846,7 @@ static void process_control_fd(int fd, const vector<Transmitter*> &stream_ts)
                 continue;
             }
 
-            // Close open FEC block if any
-            while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
-
-            t->init_session(fec_k, fec_n);
-
-            // Emulate FEC for initial session key distribution
-            for(int i = 0; i < fec_n - fec_k + 1; i++)
-            {
-                t->send_session_key();
-            }
+            apply_fec_settings(t, fec_k, fec_n);
 
             sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
             WFB_INFO("Session restarted with FEC %d/%d\n", fec_k, fec_n);
@@ -905,6 +923,155 @@ static void process_control_fd(int fd, const vector<Transmitter*> &stream_ts)
             }
 
             radiotap_header_t hdr = t->get_radiotap_header();
+
+            resp.u.cmd_get_radio.stbc = hdr.stbc;
+            resp.u.cmd_get_radio.ldpc = hdr.ldpc;
+            resp.u.cmd_get_radio.short_gi = hdr.short_gi;
+            resp.u.cmd_get_radio.bandwidth = hdr.bandwidth;
+            resp.u.cmd_get_radio.mcs_index = hdr.mcs_index;
+            resp.u.cmd_get_radio.vht_mode = hdr.vht_mode;
+            resp.u.cmd_get_radio.vht_nss = hdr.vht_nss;
+
+            sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_radio), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+        }
+        break;
+
+        case CMD_SET_FEC_STREAM:
+        {
+            if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_fec_stream))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            Transmitter *st = find_stream_by_radio_port(stream_ts, req.u.cmd_set_fec_stream.radio_port);
+            int fec_k = req.u.cmd_set_fec_stream.k;
+            int fec_n = req.u.cmd_set_fec_stream.n;
+
+            if (st == NULL)
+            {
+                resp.rc = htonl(ENODEV);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                WFB_ERR("No stream with radio_port %u\n", req.u.cmd_set_fec_stream.radio_port);
+                continue;
+            }
+
+            if(!(fec_k <= fec_n && fec_k >=1 && fec_n >= 1 && fec_n < 256))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                WFB_ERR("Rejecting new FEC settings");
+                continue;
+            }
+
+            apply_fec_settings(st, fec_k, fec_n);
+
+            sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+            WFB_INFO("Stream %u: session restarted with FEC %d/%d\n",
+                     req.u.cmd_set_fec_stream.radio_port, fec_k, fec_n);
+        }
+        break;
+
+        case CMD_SET_RADIO_STREAM:
+        {
+            if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_radio_stream))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            Transmitter *st = find_stream_by_radio_port(stream_ts, req.u.cmd_set_radio_stream.radio_port);
+
+            if (st == NULL)
+            {
+                resp.rc = htonl(ENODEV);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                WFB_ERR("No stream with radio_port %u\n", req.u.cmd_set_radio_stream.radio_port);
+                continue;
+            }
+
+            try
+            {
+                auto radiotap_header = init_radiotap_header(req.u.cmd_set_radio_stream.stbc,
+                                                            req.u.cmd_set_radio_stream.ldpc,
+                                                            req.u.cmd_set_radio_stream.short_gi,
+                                                            req.u.cmd_set_radio_stream.bandwidth,
+                                                            req.u.cmd_set_radio_stream.mcs_index,
+                                                            req.u.cmd_set_radio_stream.vht_mode,
+                                                            req.u.cmd_set_radio_stream.vht_nss);
+                st->update_radiotap_header(radiotap_header);
+            }
+            catch(runtime_error &e)
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                WFB_ERR("Rejecting new radiotap header: %s\n", e.what());
+                continue;
+            }
+
+            sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+            WFB_INFO("Stream %u: radiotap updated with stbc=%d, ldpc=%d, short_gi=%d, bandwidth=%d, mcs_index=%d, vht_mode=%d, vht_nss=%d\n",
+                    req.u.cmd_set_radio_stream.radio_port,
+                    req.u.cmd_set_radio_stream.stbc,
+                    req.u.cmd_set_radio_stream.ldpc,
+                    req.u.cmd_set_radio_stream.short_gi,
+                    req.u.cmd_set_radio_stream.bandwidth,
+                    req.u.cmd_set_radio_stream.mcs_index,
+                    req.u.cmd_set_radio_stream.vht_mode,
+                    req.u.cmd_set_radio_stream.vht_nss);
+        }
+        break;
+
+        case CMD_GET_FEC_STREAM:
+        {
+            int fec_k = 0, fec_n = 0;
+
+            if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_get_fec_stream))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            Transmitter *st = find_stream_by_radio_port(stream_ts, req.u.cmd_get_fec_stream.radio_port);
+
+            if (st == NULL)
+            {
+                resp.rc = htonl(ENODEV);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            st->get_fec(fec_k, fec_n);
+
+            resp.u.cmd_get_fec.k = fec_k;
+            resp.u.cmd_get_fec.n = fec_n;
+
+            sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_fec), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+        }
+        break;
+
+        case CMD_GET_RADIO_STREAM:
+        {
+            if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_get_radio_stream))
+            {
+                resp.rc = htonl(EINVAL);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            Transmitter *st = find_stream_by_radio_port(stream_ts, req.u.cmd_get_radio_stream.radio_port);
+
+            if (st == NULL)
+            {
+                resp.rc = htonl(ENODEV);
+                sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                continue;
+            }
+
+            radiotap_header_t hdr = st->get_radiotap_header();
 
             resp.u.cmd_get_radio.stbc = hdr.stbc;
             resp.u.cmd_get_radio.ldpc = hdr.ldpc;
